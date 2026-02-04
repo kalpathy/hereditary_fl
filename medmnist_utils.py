@@ -80,6 +80,14 @@ MEDMNIST_DATASETS = {
         "n_classes": 8,
         "task": "multi-class"
     },
+    "colormnist": {
+        "name": "ColorMNIST",
+        "description": "Colored MNIST digits (10 classes)",
+        "n_channels": 3,
+        "n_classes": 10,
+        "task": "multi-class",
+        "synthetic": True
+    },
 }
 
 
@@ -90,18 +98,127 @@ def get_dataset_info(dataset_name: str) -> Dict:
     return MEDMNIST_DATASETS[dataset_name]
 
 
+def generate_colormnist(
+    n_train: int = 50000,
+    n_test: int = 10000,
+    correlation: float = 0.9,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Generate ColorMNIST dataset - MNIST digits with colored backgrounds.
+    
+    Each digit class gets a correlated color, useful for studying:
+    - Spurious correlations in federated learning
+    - Domain shift between clients
+    - Non-IID effects from color distribution
+    
+    Args:
+        n_train: Number of training samples
+        n_test: Number of test samples
+        correlation: How strongly color correlates with digit (0.0-1.0)
+        seed: Random seed
+    
+    Returns:
+        Tuple of (X_train, y_train, X_val, y_val, X_test, y_test)
+    """
+    from torchvision import datasets, transforms
+    import os
+    
+    np.random.seed(seed)
+    
+    # Define 10 distinct colors (RGB) for 10 digit classes
+    COLORS = np.array([
+        [255, 0, 0],      # 0: Red
+        [0, 255, 0],      # 1: Green
+        [0, 0, 255],      # 2: Blue
+        [255, 255, 0],    # 3: Yellow
+        [255, 0, 255],    # 4: Magenta
+        [0, 255, 255],    # 5: Cyan
+        [255, 128, 0],    # 6: Orange
+        [128, 0, 255],    # 7: Purple
+        [0, 255, 128],    # 8: Spring Green
+        [255, 128, 128],  # 9: Light Red/Pink
+    ], dtype=np.uint8)
+    
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    
+    # Load original MNIST
+    mnist_train = datasets.MNIST(root=data_dir, train=True, download=True)
+    mnist_test = datasets.MNIST(root=data_dir, train=False, download=True)
+    
+    def colorize_mnist(images, labels, n_samples, corr):
+        """Colorize MNIST images based on labels with some noise."""
+        # Sample indices
+        indices = np.random.choice(len(images), size=min(n_samples, len(images)), replace=False)
+        
+        colored_images = []
+        sampled_labels = []
+        
+        for idx in indices:
+            img = np.array(images[idx])
+            label = int(labels[idx])
+            
+            # Decide if color correlates with label or is random
+            if np.random.random() < corr:
+                color = COLORS[label]
+            else:
+                # Random color from other classes
+                other_colors = [i for i in range(10) if i != label]
+                color = COLORS[np.random.choice(other_colors)]
+            
+            # Create RGB image: colored background, white digit
+            colored = np.zeros((28, 28, 3), dtype=np.uint8)
+            
+            # Background color where digit is not
+            mask = img < 128
+            for c in range(3):
+                colored[:, :, c] = np.where(mask, color[c], img)
+            
+            colored_images.append(colored)
+            sampled_labels.append(label)
+        
+        return np.array(colored_images), np.array(sampled_labels)
+    
+    # Generate colored datasets
+    X_train, y_train = colorize_mnist(
+        mnist_train.data.numpy(), 
+        mnist_train.targets.numpy(), 
+        n_train, 
+        correlation
+    )
+    
+    X_test, y_test = colorize_mnist(
+        mnist_test.data.numpy(), 
+        mnist_test.targets.numpy(), 
+        n_test, 
+        correlation
+    )
+    
+    # Create validation set from training
+    n_val = min(5000, len(X_train) // 10)
+    X_val, y_val = X_train[:n_val], y_train[:n_val]
+    X_train, y_train = X_train[n_val:], y_train[n_val:]
+    
+    return X_train, y_train, X_val, y_val, X_test, y_test
+
+
 def load_medmnist(
     dataset_name: str,
     data_dir: str = None,
     download: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Load a MedMNIST dataset.
+    Load a MedMNIST dataset (or ColorMNIST).
     
     Returns:
         Tuple of (X_train, y_train, X_val, y_val, X_test, y_test)
     """
     import os
+    
+    # Handle ColorMNIST separately
+    if dataset_name == "colormnist":
+        return generate_colormnist()
     
     # Use default data directory if not specified
     if data_dir is None:
