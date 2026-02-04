@@ -2,7 +2,8 @@
 """Test ColorMNIST domain-based partitioning."""
 
 import sys
-sys.path.insert(0, '/Users/kalpathj/Documents/vibeCoding/claude/hereditary_fl')
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from medmnist_utils import load_medmnist, partition_colormnist_by_domain
 import numpy as np
