@@ -173,26 +173,21 @@ elif dataset_type == "ColorMNIST (Colored Digits)":
     **ColorMNIST**
     - Colored MNIST digits (28x28 RGB)
     - 10 classes (digits 0-9)
-    - **Multiple domains** with varying color-label correlations
-    - Great for studying spurious correlations & domain shift!
+    - **Each client = 1 domain** with different color-label correlation
+    - Great for studying domain shift in FL!
     """)
     
     # ColorMNIST specific settings
     color_correlation = st.sidebar.slider(
         "Max Color-Label Correlation", 
         0.5, 1.0, 0.9, 0.1,
-        help="Maximum correlation (Domain 0). Other domains decrease from this value."
+        help="Maximum correlation for first client. Other clients have decreasing correlation."
     )
     colormnist_samples = st.sidebar.slider("Training Samples", 10000, 50000, 30000, step=5000)
-    colormnist_n_domains = st.sidebar.slider(
-        "Number of Domains", 2, 6, 4,
-        help="Each domain has different color-label correlation. Domains are distributed to clients."
-    )
-    use_domain_split = st.sidebar.checkbox(
-        "Split by Domain", 
-        value=True,
-        help="If checked, each client gets data from specific domains (natural non-IID). If unchecked, uses standard IID/non-IID split."
-    )
+    
+    # Domain count will be set equal to n_clients later
+    colormnist_n_domains = None  # Placeholder, set after n_clients is defined
+    use_domain_split = True  # Always use domain split for ColorMNIST
     
     medmnist_dataset = "colormnist"
     n_classes = 10
@@ -260,7 +255,15 @@ else:  # MedMNIST
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("👥 Client Settings")
-n_clients = st.sidebar.slider("Number of Clients", 2, 10, 3)
+
+# Default to 4 clients for ColorMNIST (matches typical 4 domains)
+default_clients = 4 if dataset_type == "ColorMNIST (Colored Digits)" else 3
+n_clients = st.sidebar.slider("Number of Clients", 2, 10, default_clients)
+
+# For ColorMNIST: set domains = clients (1 domain per client)
+if dataset_type == "ColorMNIST (Colored Digits)":
+    colormnist_n_domains = n_clients
+    st.sidebar.caption(f"📊 {n_clients} domains (one per client) with correlation range {color_correlation:.1f} → {max(0.1, color_correlation - 0.6*(n_clients-1)/max(1,n_clients-1)):.1f}")
 
 # For ColorMNIST with domain split, IID option is not applicable
 if dataset_type == "ColorMNIST (Colored Digits)" and use_domain_split:
@@ -339,14 +342,19 @@ with col1:
                     # Partition by domain or standard method
                     if use_domain_split:
                         client_data = partition_colormnist_by_domain(X_train, y_train, domains_train, n_clients)
-                        domain_info = get_colormnist_domain_info(domains_train, n_clients)
+                        domain_info = get_colormnist_domain_info(domains_train, n_clients, base_correlation=color_correlation)
+                        domain_correlations = domain_info.get("domain_correlations", None)
                         st.info(f"🌈 Using domain-based split: {domain_info['n_domains']} domains distributed to {n_clients} clients")
+                        st.caption(f"📊 Domain correlations: {domain_correlations} (higher = color predicts label, lower = harder task)")
                     elif iid:
                         client_data = partition_medmnist_iid(X_train, y_train, n_clients)
+                        domain_correlations = None
                     else:
                         client_data = partition_medmnist_non_iid(X_train, y_train, n_clients, alpha=alpha)
+                        domain_correlations = None
                 else:
                     X_train, y_train, domains_train, X_val, y_val, X_test, y_test = load_medmnist(medmnist_dataset)
+                    domain_correlations = None  # MedMNIST doesn't have domain correlations
                     
                     # Standard partitioning for MedMNIST
                     if iid:
@@ -364,7 +372,8 @@ with col1:
                     "y_test": y_test,
                     "n_channels": n_channels,
                     "n_classes": n_classes,
-                    "iid_setting": "domain-split" if (medmnist_dataset == "colormnist" and use_domain_split) else ("iid" if iid else f"non-iid-{alpha}")
+                    "iid_setting": "domain-split" if (medmnist_dataset == "colormnist" and use_domain_split) else ("iid" if iid else f"non-iid-{alpha}"),
+                    "domain_correlations": domain_correlations  # None for MedMNIST, list for ColorMNIST
                 }
                 
                 # Create partition info
@@ -434,8 +443,8 @@ with col2:
     config_df = pd.DataFrame(config_data)
     st.dataframe(config_df, use_container_width=True, hide_index=True)
     
-    # Show sample images for MedMNIST
-    if dataset_type == "MedMNIST (Medical Images)" and st.session_state.medmnist_loaded:
+    # Show sample images for MedMNIST or ColorMNIST
+    if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] and st.session_state.medmnist_loaded:
         st.subheader("🖼️ Sample Images")
         client_data = st.session_state.medmnist_loaded["client_data"]
         
@@ -540,8 +549,15 @@ def create_medmnist_client_fn(client_data, n_channels, n_classes, model_type,
 
 def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
                             n_clients, n_rounds, batch_size, local_epochs,
-                            learning_rate, strategy_name, proximal_mu):
-    """Run FL simulation with MedMNIST data."""
+                            learning_rate, strategy_name, proximal_mu,
+                            domain_correlations=None, X_test=None, y_test=None):
+    """Run FL simulation with MedMNIST data.
+    
+    Args:
+        domain_correlations: Optional list of correlation values per client (for ColorMNIST)
+        X_test: Optional global test set features (for ColorMNIST: 0% correlation)
+        y_test: Optional global test set labels
+    """
     
     # Clear any previous progress
     clear_progress()
@@ -615,7 +631,9 @@ def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
         
         detailed_results = compute_detailed_results(
             final_params, client_data, n_channels, n_classes, model_type,
-            batch_size, n_clients, local_epochs=local_epochs, learning_rate=learning_rate
+            batch_size, n_clients, local_epochs=local_epochs, learning_rate=learning_rate,
+            domain_correlations=domain_correlations,
+            X_test_global=X_test, y_test_global=y_test
         )
     except Exception as e:
         print(f"Warning: Could not compute detailed results: {e}")
@@ -626,15 +644,23 @@ def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
 
 
 def compute_detailed_results(final_params, client_data, n_channels, n_classes, 
-                             model_type, batch_size, n_clients, local_epochs=3, learning_rate=0.001):
+                             model_type, batch_size, n_clients, local_epochs=3, learning_rate=0.001,
+                             domain_correlations=None, X_test_global=None, y_test_global=None):
     """Compute confusion matrix and per-client performance after FL training.
-    Also trains local-only models for comparison."""
+    Also trains local-only models for comparison.
+    
+    Args:
+        domain_correlations: Optional list of correlation values for each client (for ColorMNIST)
+        X_test_global: Optional global test set features (for ColorMNIST: 0% correlation)
+        y_test_global: Optional global test set labels
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     results = {
         "global_model": {},
         "client_models": [],
-        "n_classes": n_classes
+        "n_classes": n_classes,
+        "domain_correlations": domain_correlations  # Track for display
     }
     
     # Create global model and load final parameters
@@ -647,6 +673,24 @@ def compute_detailed_results(final_params, client_data, n_channels, n_classes,
     global_model.to(device)
     global_model.eval()
     
+    # Create global test loader if global test data provided (ColorMNIST 0% correlation test)
+    from torch.utils.data import DataLoader, TensorDataset
+    global_test_loader = None
+    print(f"DEBUG: X_test_global is {'provided' if X_test_global is not None else 'None'}, y_test_global is {'provided' if y_test_global is not None else 'None'}")
+    if X_test_global is not None and y_test_global is not None:
+        print(f"DEBUG: Creating global test loader with {len(X_test_global)} samples")
+        X_test_copy = np.array(X_test_global, copy=True)
+        y_test_copy = np.array(y_test_global, copy=True).flatten()
+        if X_test_copy.ndim == 3:
+            X_test_copy = X_test_copy[..., np.newaxis]
+        X_test_copy = X_test_copy.astype(np.float32) / 255.0
+        X_test_copy = np.transpose(X_test_copy, (0, 3, 1, 2))
+        global_test_dataset = TensorDataset(
+            torch.FloatTensor(X_test_copy),
+            torch.LongTensor(y_test_copy)
+        )
+        global_test_loader = DataLoader(global_test_dataset, batch_size=batch_size, shuffle=False)
+    
     # Evaluate global model on each client's data AND train local models
     all_global_preds = []
     all_global_labels = []
@@ -655,7 +699,6 @@ def compute_detailed_results(final_params, client_data, n_channels, n_classes,
         X_client, y_client = client_data[cid]
         
         # Create test loader for this client - ensure writable arrays
-        from torch.utils.data import DataLoader, TensorDataset
         X_copy = np.array(X_client, copy=True)
         y_copy = np.array(y_client, copy=True).flatten()
         
@@ -706,19 +749,34 @@ def compute_detailed_results(final_params, client_data, n_channels, n_classes,
                 loss_val.backward()
                 optimizer.step()
         
-        # Evaluate local model on client's test data
+        # Evaluate local model
         local_model.eval()
-        local_loss, local_acc, local_preds, local_labels = evaluate_with_predictions(
-            local_model, test_loader, device
-        )
         
-        # Also evaluate global model on test set for fair comparison
-        global_test_loss, global_test_acc, _, _ = evaluate_with_predictions(
-            global_model, test_loader, device
-        )
+        # For ColorMNIST: evaluate on GLOBAL 0% correlation test set
+        # For others: evaluate on client's own test split
+        if global_test_loader is not None:
+            # Use global test set (0% correlation for ColorMNIST)
+            local_loss, local_acc, local_preds, local_labels = evaluate_with_predictions(
+                local_model, global_test_loader, device
+            )
+            # Also evaluate global model on global test set
+            global_test_loss, global_test_acc, _, _ = evaluate_with_predictions(
+                global_model, global_test_loader, device
+            )
+        else:
+            # Use client's own test split
+            local_loss, local_acc, local_preds, local_labels = evaluate_with_predictions(
+                local_model, test_loader, device
+            )
+            global_test_loss, global_test_acc, _, _ = evaluate_with_predictions(
+                global_model, test_loader, device
+            )
         
         # Count unique classes in this client's data
         unique_classes = len(np.unique(y_copy))
+        
+        # Get domain correlation for this client if available
+        domain_corr = domain_correlations[cid] if domain_correlations else None
         
         results["client_models"].append({
             "client_id": cid,
@@ -726,10 +784,11 @@ def compute_detailed_results(final_params, client_data, n_channels, n_classes,
             "n_train": n_train,
             "n_test": n_test,
             "unique_classes": unique_classes,
+            "domain_correlation": domain_corr,  # ColorMNIST domain correlation
             "global_model_accuracy": acc * 100,  # On full data
             "global_model_loss": loss,
-            "global_model_test_accuracy": global_test_acc * 100,  # On test split
-            "local_model_accuracy": local_acc * 100,  # Local model on test split
+            "global_model_test_accuracy": global_test_acc * 100,  # On global test or client test
+            "local_model_accuracy": local_acc * 100,  # Local model on global test or client test
             "local_model_loss": local_loss,
             "predictions": preds,
             "labels": labels
@@ -823,15 +882,15 @@ def run_synthetic_simulation(n_clients, n_rounds, n_samples, n_features, n_class
     return history
 
 
-# Check if data is loaded for MedMNIST
+# Check if data is loaded for MedMNIST/ColorMNIST
 can_run = True
-if dataset_type == "MedMNIST (Medical Images)" and st.session_state.medmnist_loaded is None:
-    st.warning("⚠️ Please load the MedMNIST dataset first by clicking 'Load/Generate Data Preview'")
+if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] and st.session_state.medmnist_loaded is None:
+    st.warning("⚠️ Please load the dataset first by clicking 'Load/Generate Data Preview'")
     can_run = False
 
 # Store current IID setting to detect changes
 current_iid_setting = "iid" if iid else f"non-iid-{alpha}"
-if dataset_type == "MedMNIST (Medical Images)" and st.session_state.medmnist_loaded is not None:
+if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] and st.session_state.medmnist_loaded is not None:
     stored_setting = st.session_state.medmnist_loaded.get("iid_setting", None)
     if stored_setting != current_iid_setting:
         st.info("ℹ️ IID setting changed. Click 'Load/Generate Data Preview' to repartition data, or the simulation will repartition automatically.")
@@ -849,7 +908,7 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
     
     # Copy data BEFORE starting thread (to avoid session_state access in thread)
     medmnist_data = None
-    if dataset_type == "MedMNIST (Medical Images)" and st.session_state.medmnist_loaded:
+    if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] and st.session_state.medmnist_loaded:
         medmnist_data = {
             "X_train": st.session_state.medmnist_loaded["X_train"],
             "y_train": st.session_state.medmnist_loaded["y_train"],
@@ -857,6 +916,10 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
             "n_channels": st.session_state.medmnist_loaded["n_channels"],
             "n_classes": st.session_state.medmnist_loaded["n_classes"],
             "iid_setting": st.session_state.medmnist_loaded.get("iid_setting"),
+            "dataset": st.session_state.medmnist_loaded.get("dataset"),
+            "domain_correlations": st.session_state.medmnist_loaded.get("domain_correlations"),
+            "X_test": st.session_state.medmnist_loaded.get("X_test"),
+            "y_test": st.session_state.medmnist_loaded.get("y_test"),
         }
     
     # Use dict to store results (mutable, works in nested function)
@@ -936,7 +999,10 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
                     local_epochs=params["local_epochs"],
                     learning_rate=params["learning_rate"],
                     strategy_name=params["strategy_name"],
-                    proximal_mu=params["proximal_mu"]
+                    proximal_mu=params["proximal_mu"],
+                    domain_correlations=loaded.get("domain_correlations"),
+                    X_test=loaded.get("X_test"),
+                    y_test=loaded.get("y_test")
                 )
         except Exception as e:
             import traceback
@@ -986,7 +1052,7 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
         
         progress_bar.progress(100, text=f"✅ Completed all {n_rounds} rounds!")
         status_text.success(f"✅ Federated learning completed successfully!")
-        if dataset_type == "MedMNIST (Medical Images)" and sim_state["loaded"]:
+        if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] and sim_state["loaded"]:
             st.session_state.medmnist_loaded.update(sim_state["loaded"])
     
     clear_progress()
@@ -1122,11 +1188,24 @@ if st.session_state.detailed_results is not None:
     
     with tab2:
         st.markdown("### 🏥 Local vs Global Model Comparison")
-        st.markdown("""
-        **Why this matters:** In federated learning, we want the global model to outperform 
-        local-only models. Local models only see data from one site, while the global model 
-        learns from all sites combined.
-        """)
+        
+        # Check if we have domain correlations (ColorMNIST)
+        domain_correlations = detailed.get("domain_correlations")
+        if domain_correlations:
+            st.markdown("""
+            **ColorMNIST Domain Analysis:** Each client has a different color-label correlation:
+            - **High correlation (0.9)**: Color predicts label → model can "cheat" using color
+            - **Low correlation (0.3)**: Color is random → model must learn actual digit shapes
+            
+            The **test set has 0% correlation** (random colors), so it tests TRUE digit recognition.
+            Local models trained on high-correlation data will fail on this test!
+            """)
+        else:
+            st.markdown("""
+            **Why this matters:** In federated learning, we want the global model to outperform 
+            local-only models. Local models only see data from one site, while the global model 
+            learns from all sites combined.
+            """)
         
         # Create comparison chart
         client_results = detailed["client_models"]
@@ -1159,9 +1238,17 @@ if st.session_state.detailed_results is not None:
             
             ax.set_xlabel("Site (Client)", fontsize=12)
             ax.set_ylabel("Test Accuracy (%)", fontsize=12)
-            ax.set_title("Local-Only vs Federated Global Model Performance", fontsize=14)
+            
+            # Use domain correlations in x-axis labels if available
+            if domain_correlations:
+                xlabels = [f"Site {r['client_id']}\n(corr={domain_correlations[r['client_id']]:.1f})" for r in client_results]
+                ax.set_title("Local vs Global Model on 0%-Correlation Test Set", fontsize=14)
+            else:
+                xlabels = [f"Site {r['client_id']}" for r in client_results]
+                ax.set_title("Local-Only vs Federated Global Model Performance", fontsize=14)
+            
             ax.set_xticks(x)
-            ax.set_xticklabels([f"Site {r['client_id']}" for r in client_results])
+            ax.set_xticklabels(xlabels)
             ax.set_ylim([0, max(max(local_acc), max(global_acc)) * 1.15])
             ax.legend(loc='upper right')
             ax.grid(True, alpha=0.3, axis='y')
@@ -1186,19 +1273,33 @@ if st.session_state.detailed_results is not None:
             else:
                 st.warning(f"⚠️ Local models performed better. Try more FL rounds or adjust hyperparameters.")
             
+            # ColorMNIST-specific insight
+            if domain_correlations:
+                # Check if local performance follows expected pattern (worse for high-correlation sites)
+                st.markdown("### 🎨 ColorMNIST Insight")
+                st.markdown("""
+                **Expected pattern:** Sites with higher training correlation (more color-label dependency) 
+                should have **worse** local model performance on the 0%-correlation test set, because 
+                their local models learned to rely on color shortcuts.
+                """)
+            
             # Detailed table
             st.markdown("### Detailed Site Comparison")
             site_table = []
             for r in client_results:
                 diff = r['global_model_test_accuracy'] - r['local_model_accuracy']
-                site_table.append({
+                row = {
                     "Site": f"Site {r['client_id']}",
                     "Samples": r['n_samples'],
                     "Classes": r.get('unique_classes', 'N/A'),
                     "Local Acc (%)": f"{r['local_model_accuracy']:.2f}",
                     "Global Acc (%)": f"{r['global_model_test_accuracy']:.2f}",
                     "Difference": f"{diff:+.2f}%"
-                })
+                }
+                # Add correlation if available
+                if domain_correlations and r['client_id'] < len(domain_correlations):
+                    row["Domain Corr"] = f"{domain_correlations[r['client_id']]:.2f}"
+                site_table.append(row)
             
             site_df = pd.DataFrame(site_table)
             st.dataframe(site_df, use_container_width=True, hide_index=True)

@@ -207,13 +207,13 @@ def generate_colormnist(
     y_train = np.concatenate(y_train_list, axis=0)
     domains_train = np.concatenate(domains_train_list, axis=0)
     
-    # Test set uses mid-range correlation (domain generalization test)
-    mid_corr = (correlation + max(0.1, correlation - 0.6)) / 2
+    # Test set uses 0% correlation - tests TRUE digit recognition
+    # This is the key: models that learn color shortcuts will fail here
     X_test, y_test = colorize_mnist(
         mnist_test.data.numpy(), 
         mnist_test.targets.numpy(), 
         n_test, 
-        mid_corr
+        0.0  # Zero correlation - random colors
     )
     
     # Create validation set from training (sample from all domains)
@@ -238,17 +238,17 @@ def partition_colormnist_by_domain(
     n_clients: int
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
-    Partition ColorMNIST data by domain - each client gets data from specific domains.
+    Partition ColorMNIST data by domain - each client gets exactly one domain.
     
-    This creates natural non-IID distribution based on different color-label
-    correlations, simulating real-world scenarios where different sites have
-    different data distributions.
+    Assumes n_domains == n_clients (1:1 mapping).
+    Each client/domain has a different color-label correlation, simulating
+    different sites with different data distributions.
     
     Args:
         X: Image data
         y: Labels
         domains: Domain assignment for each sample
-        n_clients: Number of clients
+        n_clients: Number of clients (should equal number of domains)
     
     Returns:
         List of (X_client, y_client) tuples
@@ -256,71 +256,49 @@ def partition_colormnist_by_domain(
     unique_domains = np.unique(domains)
     n_domains = len(unique_domains)
     
-    client_data = []
+    # Verify 1:1 mapping
+    if n_domains != n_clients:
+        raise ValueError(f"Expected n_domains ({n_domains}) == n_clients ({n_clients})")
     
-    if n_clients <= n_domains:
-        # Assign one or more domains per client
-        domains_per_client = n_domains // n_clients
-        remainder = n_domains % n_clients
-        
-        domain_idx = 0
-        for client_id in range(n_clients):
-            # This client gets domains_per_client domains (plus 1 extra if in remainder)
-            n_domains_for_client = domains_per_client + (1 if client_id < remainder else 0)
-            
-            client_indices = []
-            for _ in range(n_domains_for_client):
-                if domain_idx < n_domains:
-                    domain = unique_domains[domain_idx]
-                    client_indices.extend(np.where(domains == domain)[0])
-                    domain_idx += 1
-            
-            if len(client_indices) > 0:
-                client_indices = np.array(client_indices)
-                np.random.shuffle(client_indices)
-                client_data.append((X[client_indices], y[client_indices]))
-            else:
-                # Fallback: give small random sample
-                sample_indices = np.random.choice(len(X), size=100, replace=False)
-                client_data.append((X[sample_indices], y[sample_indices]))
-    else:
-        # More clients than domains: split each domain across multiple clients
-        samples_per_client = len(X) // n_clients
-        
-        # Shuffle all indices
-        all_indices = np.arange(len(X))
-        np.random.shuffle(all_indices)
-        
-        # But keep domain structure - sort by domain first, then distribute
-        domain_sorted_indices = np.argsort(domains)
-        
-        for client_id in range(n_clients):
-            start = client_id * samples_per_client
-            end = start + samples_per_client if client_id < n_clients - 1 else len(X)
-            client_indices = domain_sorted_indices[start:end]
-            np.random.shuffle(client_indices)
-            client_data.append((X[client_indices], y[client_indices]))
+    # Simple 1:1 mapping: client i gets domain i
+    client_data = []
+    for client_id in range(n_clients):
+        domain = unique_domains[client_id]
+        client_indices = np.where(domains == domain)[0]
+        np.random.shuffle(client_indices)
+        client_data.append((X[client_indices], y[client_indices]))
     
     return client_data
 
 
-def get_colormnist_domain_info(domains: np.ndarray, n_clients: int) -> Dict:
+def get_colormnist_domain_info(domains: np.ndarray, n_clients: int, base_correlation: float = 0.9) -> Dict:
     """
     Get information about which domains each client will receive.
     
+    Args:
+        domains: Domain assignment array
+        n_clients: Number of clients
+        base_correlation: Starting correlation (default 0.9)
+    
     Returns:
-        Dictionary with domain distribution info
+        Dictionary with domain distribution info including correlations
     """
     unique_domains = np.unique(domains)
     n_domains = len(unique_domains)
     samples_per_domain = {int(d): int(np.sum(domains == d)) for d in unique_domains}
     
-    # Domain correlations (approximate, assuming linear spacing)
-    # This is for display purposes
+    # Compute actual domain correlations (matching generate_colormnist logic)
+    # Correlations go from base_correlation down to base_correlation - 0.6
+    domain_correlations = []
+    for i in range(n_domains):
+        corr = base_correlation - i * (0.6 / max(1, n_domains - 1))
+        domain_correlations.append(round(corr, 2))
+    
     domain_info = {
         "n_domains": n_domains,
         "samples_per_domain": samples_per_domain,
-        "total_samples": len(domains)
+        "total_samples": len(domains),
+        "domain_correlations": domain_correlations  # One per client/domain
     }
     
     return domain_info
