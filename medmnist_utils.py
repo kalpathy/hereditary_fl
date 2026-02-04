@@ -102,24 +102,25 @@ def generate_colormnist(
     n_train: int = 50000,
     n_test: int = 10000,
     correlation: float = 0.9,
+    n_domains: int = 4,
     seed: int = 42
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Generate ColorMNIST dataset - MNIST digits with colored backgrounds.
+    Generate ColorMNIST dataset with multiple domains (varying correlations).
     
-    Each digit class gets a correlated color, useful for studying:
-    - Spurious correlations in federated learning
-    - Domain shift between clients
-    - Non-IID effects from color distribution
+    Each domain has a different color-label correlation, simulating different
+    "environments" or "sites" in federated learning with distribution shift.
     
     Args:
-        n_train: Number of training samples
+        n_train: Total number of training samples (split across domains)
         n_test: Number of test samples
-        correlation: How strongly color correlates with digit (0.0-1.0)
+        correlation: Base correlation (domains will vary around this)
+        n_domains: Number of distinct domains to create
         seed: Random seed
     
     Returns:
-        Tuple of (X_train, y_train, X_val, y_val, X_test, y_test)
+        Tuple of (X_train, y_train, domains_train, X_val, y_val, X_test, y_test)
+        - domains_train: array indicating which domain each training sample belongs to
     """
     from torchvision import datasets, transforms
     import os
@@ -180,45 +181,184 @@ def generate_colormnist(
         
         return np.array(colored_images), np.array(sampled_labels)
     
-    # Generate colored datasets
-    X_train, y_train = colorize_mnist(
-        mnist_train.data.numpy(), 
-        mnist_train.targets.numpy(), 
-        n_train, 
-        correlation
-    )
+    # Create domains with varying correlations
+    # Domains range from high correlation to low correlation
+    domain_correlations = np.linspace(correlation, max(0.1, correlation - 0.6), n_domains)
     
+    # Split training samples across domains
+    samples_per_domain = n_train // n_domains
+    
+    X_train_list = []
+    y_train_list = []
+    domains_train_list = []
+    
+    for domain_id, domain_corr in enumerate(domain_correlations):
+        X_domain, y_domain = colorize_mnist(
+            mnist_train.data.numpy(), 
+            mnist_train.targets.numpy(), 
+            samples_per_domain, 
+            domain_corr
+        )
+        X_train_list.append(X_domain)
+        y_train_list.append(y_domain)
+        domains_train_list.append(np.full(len(X_domain), domain_id))
+    
+    X_train = np.concatenate(X_train_list, axis=0)
+    y_train = np.concatenate(y_train_list, axis=0)
+    domains_train = np.concatenate(domains_train_list, axis=0)
+    
+    # Test set uses mid-range correlation (domain generalization test)
+    mid_corr = (correlation + max(0.1, correlation - 0.6)) / 2
     X_test, y_test = colorize_mnist(
         mnist_test.data.numpy(), 
         mnist_test.targets.numpy(), 
         n_test, 
-        correlation
+        mid_corr
     )
     
-    # Create validation set from training
+    # Create validation set from training (sample from all domains)
     n_val = min(5000, len(X_train) // 10)
-    X_val, y_val = X_train[:n_val], y_train[:n_val]
-    X_train, y_train = X_train[n_val:], y_train[n_val:]
+    val_indices = np.random.choice(len(X_train), size=n_val, replace=False)
+    X_val, y_val = X_train[val_indices], y_train[val_indices]
     
-    return X_train, y_train, X_val, y_val, X_test, y_test
+    # Remove validation samples from training
+    train_mask = np.ones(len(X_train), dtype=bool)
+    train_mask[val_indices] = False
+    X_train = X_train[train_mask]
+    y_train = y_train[train_mask]
+    domains_train = domains_train[train_mask]
+    
+    return X_train, y_train, domains_train, X_val, y_val, X_test, y_test
+
+
+def partition_colormnist_by_domain(
+    X: np.ndarray,
+    y: np.ndarray,
+    domains: np.ndarray,
+    n_clients: int
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Partition ColorMNIST data by domain - each client gets data from specific domains.
+    
+    This creates natural non-IID distribution based on different color-label
+    correlations, simulating real-world scenarios where different sites have
+    different data distributions.
+    
+    Args:
+        X: Image data
+        y: Labels
+        domains: Domain assignment for each sample
+        n_clients: Number of clients
+    
+    Returns:
+        List of (X_client, y_client) tuples
+    """
+    unique_domains = np.unique(domains)
+    n_domains = len(unique_domains)
+    
+    client_data = []
+    
+    if n_clients <= n_domains:
+        # Assign one or more domains per client
+        domains_per_client = n_domains // n_clients
+        remainder = n_domains % n_clients
+        
+        domain_idx = 0
+        for client_id in range(n_clients):
+            # This client gets domains_per_client domains (plus 1 extra if in remainder)
+            n_domains_for_client = domains_per_client + (1 if client_id < remainder else 0)
+            
+            client_indices = []
+            for _ in range(n_domains_for_client):
+                if domain_idx < n_domains:
+                    domain = unique_domains[domain_idx]
+                    client_indices.extend(np.where(domains == domain)[0])
+                    domain_idx += 1
+            
+            if len(client_indices) > 0:
+                client_indices = np.array(client_indices)
+                np.random.shuffle(client_indices)
+                client_data.append((X[client_indices], y[client_indices]))
+            else:
+                # Fallback: give small random sample
+                sample_indices = np.random.choice(len(X), size=100, replace=False)
+                client_data.append((X[sample_indices], y[sample_indices]))
+    else:
+        # More clients than domains: split each domain across multiple clients
+        samples_per_client = len(X) // n_clients
+        
+        # Shuffle all indices
+        all_indices = np.arange(len(X))
+        np.random.shuffle(all_indices)
+        
+        # But keep domain structure - sort by domain first, then distribute
+        domain_sorted_indices = np.argsort(domains)
+        
+        for client_id in range(n_clients):
+            start = client_id * samples_per_client
+            end = start + samples_per_client if client_id < n_clients - 1 else len(X)
+            client_indices = domain_sorted_indices[start:end]
+            np.random.shuffle(client_indices)
+            client_data.append((X[client_indices], y[client_indices]))
+    
+    return client_data
+
+
+def get_colormnist_domain_info(domains: np.ndarray, n_clients: int) -> Dict:
+    """
+    Get information about which domains each client will receive.
+    
+    Returns:
+        Dictionary with domain distribution info
+    """
+    unique_domains = np.unique(domains)
+    n_domains = len(unique_domains)
+    samples_per_domain = {int(d): int(np.sum(domains == d)) for d in unique_domains}
+    
+    # Domain correlations (approximate, assuming linear spacing)
+    # This is for display purposes
+    domain_info = {
+        "n_domains": n_domains,
+        "samples_per_domain": samples_per_domain,
+        "total_samples": len(domains)
+    }
+    
+    return domain_info
 
 
 def load_medmnist(
     dataset_name: str,
     data_dir: str = None,
-    download: bool = True
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    download: bool = True,
+    colormnist_correlation: float = 0.9,
+    colormnist_n_train: int = 30000,
+    colormnist_n_domains: int = 4
+) -> Tuple:
     """
     Load a MedMNIST dataset (or ColorMNIST).
     
+    Args:
+        dataset_name: Name of the dataset
+        data_dir: Directory to store data
+        download: Whether to download if not present
+        colormnist_correlation: Color-label correlation for ColorMNIST (0.0-1.0)
+        colormnist_n_train: Number of training samples for ColorMNIST
+        colormnist_n_domains: Number of domains for ColorMNIST
+    
     Returns:
-        Tuple of (X_train, y_train, X_val, y_val, X_test, y_test)
+        For ColorMNIST: Tuple of (X_train, y_train, domains_train, X_val, y_val, X_test, y_test)
+        For others: Tuple of (X_train, y_train, None, X_val, y_val, X_test, y_test)
     """
     import os
     
     # Handle ColorMNIST separately
     if dataset_name == "colormnist":
-        return generate_colormnist()
+        return generate_colormnist(
+            n_train=colormnist_n_train,
+            n_test=10000,
+            correlation=colormnist_correlation,
+            n_domains=colormnist_n_domains
+        )
     
     # Use default data directory if not specified
     if data_dir is None:
@@ -245,7 +385,8 @@ def load_medmnist(
     X_test = test_dataset.imgs
     y_test = test_dataset.labels.flatten()
     
-    return X_train, y_train, X_val, y_val, X_test, y_test
+    # Return None for domains (no domain info for MedMNIST)
+    return X_train, y_train, None, X_val, y_val, X_test, y_test
 
 
 def preprocess_images(images: np.ndarray, n_channels: int) -> torch.Tensor:

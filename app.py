@@ -106,6 +106,7 @@ from model import SimpleNet, get_parameters, set_parameters
 from medmnist_utils import (
     MEDMNIST_DATASETS, load_medmnist, 
     partition_medmnist_iid, partition_medmnist_non_iid,
+    partition_colormnist_by_domain, get_colormnist_domain_info,
     create_medmnist_dataloaders, get_dataset_info, get_client_distribution
 )
 from cnn_model import (
@@ -146,7 +147,7 @@ st.sidebar.header("⚙️ Configuration")
 st.sidebar.subheader("📊 Dataset")
 dataset_type = st.sidebar.selectbox(
     "Dataset Type",
-    ["Synthetic (Tabular)", "MedMNIST (Medical Images)"]
+    ["Synthetic (Tabular)", "MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"]
 )
 
 if dataset_type == "Synthetic (Tabular)":
@@ -160,15 +161,66 @@ if dataset_type == "Synthetic (Tabular)":
     medmnist_dataset = None
     model_type = "simple"
     n_channels = 1
+    color_correlation = 0.9
+    colormnist_samples = 30000
+    colormnist_n_domains = 4
+    use_domain_split = False
+
+elif dataset_type == "ColorMNIST (Colored Digits)":
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎨 ColorMNIST Settings")
+    st.sidebar.info("""
+    **ColorMNIST**
+    - Colored MNIST digits (28x28 RGB)
+    - 10 classes (digits 0-9)
+    - **Multiple domains** with varying color-label correlations
+    - Great for studying spurious correlations & domain shift!
+    """)
+    
+    # ColorMNIST specific settings
+    color_correlation = st.sidebar.slider(
+        "Max Color-Label Correlation", 
+        0.5, 1.0, 0.9, 0.1,
+        help="Maximum correlation (Domain 0). Other domains decrease from this value."
+    )
+    colormnist_samples = st.sidebar.slider("Training Samples", 10000, 50000, 30000, step=5000)
+    colormnist_n_domains = st.sidebar.slider(
+        "Number of Domains", 2, 6, 4,
+        help="Each domain has different color-label correlation. Domains are distributed to clients."
+    )
+    use_domain_split = st.sidebar.checkbox(
+        "Split by Domain", 
+        value=True,
+        help="If checked, each client gets data from specific domains (natural non-IID). If unchecked, uses standard IID/non-IID split."
+    )
+    
+    medmnist_dataset = "colormnist"
+    n_classes = 10
+    n_channels = 3
+    n_features = None
+    n_samples = None
+    
+    # Model selection
+    st.sidebar.subheader("🧠 CNN Model")
+    model_type = st.sidebar.selectbox(
+        "Model Architecture",
+        ["simple", "cnn", "resnet"],
+        format_func=lambda x: {
+            "simple": "SimpleCNN (Fast, ~50K params)",
+            "cnn": "MedMNIST-CNN (Medium, ~300K params)", 
+            "resnet": "ResNet-style (Powerful, ~500K params)"
+        }[x]
+    )
     
 else:  # MedMNIST
     st.sidebar.markdown("---")
     st.sidebar.subheader("🏥 MedMNIST Dataset")
     
-    # Dataset selection with descriptions
+    # Dataset selection with descriptions - exclude colormnist
     medmnist_options = {
         name: f"{info['name']} - {info['description']}"
         for name, info in MEDMNIST_DATASETS.items()
+        if name != "colormnist"
     }
     medmnist_dataset = st.sidebar.selectbox(
         "Select Dataset",
@@ -189,6 +241,10 @@ else:  # MedMNIST
     n_channels = dataset_info['n_channels']
     n_features = None
     n_samples = None
+    color_correlation = 0.9
+    colormnist_samples = 30000
+    colormnist_n_domains = 4
+    use_domain_split = False
     
     # Model selection
     st.sidebar.subheader("🧠 CNN Model")
@@ -205,16 +261,23 @@ else:  # MedMNIST
 st.sidebar.markdown("---")
 st.sidebar.subheader("👥 Client Settings")
 n_clients = st.sidebar.slider("Number of Clients", 2, 10, 3)
-iid = st.sidebar.checkbox("IID Data Distribution", value=True)
 
-if not iid and dataset_type == "MedMNIST (Medical Images)":
-    alpha = st.sidebar.slider(
-        "Dirichlet α (lower = more non-IID)", 
-        0.1, 2.0, 0.5, step=0.1,
-        help="Controls data heterogeneity. Lower values create more non-IID distributions."
-    )
+# For ColorMNIST with domain split, IID option is not applicable
+if dataset_type == "ColorMNIST (Colored Digits)" and use_domain_split:
+    st.sidebar.info("📍 Using domain-based split (natural non-IID from varying correlations)")
+    iid = False  # Domain split is inherently non-IID
+    alpha = 0.5  # Not used with domain split
 else:
-    alpha = 0.5
+    iid = st.sidebar.checkbox("IID Data Distribution", value=True)
+    
+    if not iid and dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"]:
+        alpha = st.sidebar.slider(
+            "Dirichlet α (lower = more non-IID)", 
+            0.1, 2.0, 0.5, step=0.1,
+            help="Controls data heterogeneity. Lower values create more non-IID distributions."
+        )
+    else:
+        alpha = 0.5
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔄 Training Settings")
@@ -263,14 +326,33 @@ with col1:
                     })
                 st.session_state.medmnist_loaded = None
                 
-            else:  # MedMNIST
-                X_train, y_train, X_val, y_val, X_test, y_test = load_medmnist(medmnist_dataset)
-                
-                # Partition training data
-                if iid:
-                    client_data = partition_medmnist_iid(X_train, y_train, n_clients)
+            else:  # MedMNIST or ColorMNIST
+                # Pass ColorMNIST-specific params if applicable
+                if medmnist_dataset == "colormnist":
+                    X_train, y_train, domains_train, X_val, y_val, X_test, y_test = load_medmnist(
+                        medmnist_dataset,
+                        colormnist_correlation=color_correlation,
+                        colormnist_n_train=colormnist_samples,
+                        colormnist_n_domains=colormnist_n_domains
+                    )
+                    
+                    # Partition by domain or standard method
+                    if use_domain_split:
+                        client_data = partition_colormnist_by_domain(X_train, y_train, domains_train, n_clients)
+                        domain_info = get_colormnist_domain_info(domains_train, n_clients)
+                        st.info(f"🌈 Using domain-based split: {domain_info['n_domains']} domains distributed to {n_clients} clients")
+                    elif iid:
+                        client_data = partition_medmnist_iid(X_train, y_train, n_clients)
+                    else:
+                        client_data = partition_medmnist_non_iid(X_train, y_train, n_clients, alpha=alpha)
                 else:
-                    client_data = partition_medmnist_non_iid(X_train, y_train, n_clients, alpha=alpha)
+                    X_train, y_train, domains_train, X_val, y_val, X_test, y_test = load_medmnist(medmnist_dataset)
+                    
+                    # Standard partitioning for MedMNIST
+                    if iid:
+                        client_data = partition_medmnist_iid(X_train, y_train, n_clients)
+                    else:
+                        client_data = partition_medmnist_non_iid(X_train, y_train, n_clients, alpha=alpha)
                 
                 # Store loaded data
                 st.session_state.medmnist_loaded = {
@@ -282,7 +364,7 @@ with col1:
                     "y_test": y_test,
                     "n_channels": n_channels,
                     "n_classes": n_classes,
-                    "iid_setting": "iid" if iid else f"non-iid-{alpha}"
+                    "iid_setting": "domain-split" if (medmnist_dataset == "colormnist" and use_domain_split) else ("iid" if iid else f"non-iid-{alpha}")
                 }
                 
                 # Create partition info
@@ -795,7 +877,8 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
         "local_epochs": local_epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
-        "model_type": model_type if dataset_type == "MedMNIST (Medical Images)" else None,
+        "model_type": model_type if dataset_type in ["MedMNIST (Medical Images)", "ColorMNIST (Colored Digits)"] else None,
+        "use_domain_split": use_domain_split if dataset_type == "ColorMNIST (Colored Digits)" else False,
     }
     
     def run_simulation_thread(params, medmnist_data, sim_state):
@@ -818,18 +901,26 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
             else:
                 loaded = medmnist_data.copy()
                 
+                # Determine current partitioning setting
+                if params.get("use_domain_split") and loaded.get("dataset") == "colormnist":
+                    current_partition = "domain-split"
+                else:
+                    current_partition = "iid" if params["iid"] else f"non-iid-{params['alpha']}"
+                
                 # Check if we need to repartition
-                current_iid = "iid" if params["iid"] else f"non-iid-{params['alpha']}"
-                if loaded.get("iid_setting") != current_iid:
+                if loaded.get("iid_setting") != current_partition:
                     update_progress(0, params["n_rounds"], "Repartitioning data...")
                     X_train = loaded["X_train"]
                     y_train = loaded["y_train"]
+                    
+                    # Domain-based split is already handled at load time
+                    # Only standard IID/non-IID repartitioning here
                     if params["iid"]:
                         client_data = partition_medmnist_iid(X_train, y_train, params["n_clients"])
                     else:
                         client_data = partition_medmnist_non_iid(X_train, y_train, params["n_clients"], alpha=params["alpha"])
                     loaded["client_data"] = client_data
-                    loaded["iid_setting"] = current_iid
+                    loaded["iid_setting"] = current_partition
                 else:
                     client_data = loaded["client_data"]
                 
