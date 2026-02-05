@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 
 # FL imports
 import flwr as fl
-from flwr.server.strategy import FedAvg, FedProx
+from flwr.server.strategy import FedAvg, FedProx, FedAdagrad, FedAdam, FedYogi, FedAvgM
 from flwr.common import Metrics, Parameters, Scalar, FitRes, EvaluateRes
 from flwr.server.client_proxy import ClientProxy
 
@@ -90,6 +90,90 @@ class ProgressFedProx(FedProx):
         update_progress(server_round, self.total_rounds, f"Round {server_round}/{self.total_rounds}: Aggregating")
         aggregated = super().aggregate_fit(server_round, results, failures)
         # Store the aggregated parameters after each round
+        if aggregated is not None and aggregated[0] is not None:
+            self.final_parameters = aggregated[0]
+        return aggregated
+    
+    def aggregate_evaluate(self, server_round, results, failures):
+        update_progress(server_round, self.total_rounds, "evaluating")
+        return super().aggregate_evaluate(server_round, results, failures)
+
+
+class ProgressFedAdagrad(FedAdagrad):
+    """FedAdagrad with progress tracking."""
+    def __init__(self, total_rounds: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_rounds = total_rounds
+        self.current_round = 0
+        self.final_parameters = None
+    
+    def aggregate_fit(self, server_round, results, failures):
+        self.current_round = server_round
+        update_progress(server_round, self.total_rounds, f"Round {server_round}/{self.total_rounds}: Aggregating (Adagrad)")
+        aggregated = super().aggregate_fit(server_round, results, failures)
+        if aggregated is not None and aggregated[0] is not None:
+            self.final_parameters = aggregated[0]
+        return aggregated
+    
+    def aggregate_evaluate(self, server_round, results, failures):
+        update_progress(server_round, self.total_rounds, "evaluating")
+        return super().aggregate_evaluate(server_round, results, failures)
+
+
+class ProgressFedAdam(FedAdam):
+    """FedAdam with progress tracking."""
+    def __init__(self, total_rounds: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_rounds = total_rounds
+        self.current_round = 0
+        self.final_parameters = None
+    
+    def aggregate_fit(self, server_round, results, failures):
+        self.current_round = server_round
+        update_progress(server_round, self.total_rounds, f"Round {server_round}/{self.total_rounds}: Aggregating (Adam)")
+        aggregated = super().aggregate_fit(server_round, results, failures)
+        if aggregated is not None and aggregated[0] is not None:
+            self.final_parameters = aggregated[0]
+        return aggregated
+    
+    def aggregate_evaluate(self, server_round, results, failures):
+        update_progress(server_round, self.total_rounds, "evaluating")
+        return super().aggregate_evaluate(server_round, results, failures)
+
+
+class ProgressFedYogi(FedYogi):
+    """FedYogi with progress tracking."""
+    def __init__(self, total_rounds: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_rounds = total_rounds
+        self.current_round = 0
+        self.final_parameters = None
+    
+    def aggregate_fit(self, server_round, results, failures):
+        self.current_round = server_round
+        update_progress(server_round, self.total_rounds, f"Round {server_round}/{self.total_rounds}: Aggregating (Yogi)")
+        aggregated = super().aggregate_fit(server_round, results, failures)
+        if aggregated is not None and aggregated[0] is not None:
+            self.final_parameters = aggregated[0]
+        return aggregated
+    
+    def aggregate_evaluate(self, server_round, results, failures):
+        update_progress(server_round, self.total_rounds, "evaluating")
+        return super().aggregate_evaluate(server_round, results, failures)
+
+
+class ProgressFedAvgM(FedAvgM):
+    """FedAvgM (with momentum) with progress tracking."""
+    def __init__(self, total_rounds: int, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.total_rounds = total_rounds
+        self.current_round = 0
+        self.final_parameters = None
+    
+    def aggregate_fit(self, server_round, results, failures):
+        self.current_round = server_round
+        update_progress(server_round, self.total_rounds, f"Round {server_round}/{self.total_rounds}: Aggregating (Momentum)")
+        aggregated = super().aggregate_fit(server_round, results, failures)
         if aggregated is not None and aggregated[0] is not None:
             self.final_parameters = aggregated[0]
         return aggregated
@@ -295,11 +379,26 @@ learning_rate = st.sidebar.select_slider(
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Strategy")
-strategy_name = st.sidebar.selectbox("Algorithm", ["FedAvg", "FedProx"])
+strategy_name = st.sidebar.selectbox(
+    "Algorithm", 
+    ["FedAvg", "FedProx", "FedAdam", "FedYogi", "FedAdagrad", "FedAvgM"],
+    help="FedAvg: Simple averaging | FedProx: Proximal regularization | FedAdam/Yogi/Adagrad: Server-side optimizers | FedAvgM: Momentum"
+)
+
+# Strategy-specific hyperparameters
+proximal_mu = 0.0
+server_lr = 0.01
+server_momentum = 0.9
+
 if strategy_name == "FedProx":
-    proximal_mu = st.sidebar.slider("Proximal μ (mu)", 0.01, 1.0, 0.5, step=0.01)
-else:
-    proximal_mu = 0.0
+    proximal_mu = st.sidebar.slider("Proximal μ (mu)", 0.01, 1.0, 0.5, step=0.01,
+                                     help="Regularization strength toward global model")
+elif strategy_name in ["FedAdam", "FedYogi", "FedAdagrad"]:
+    server_lr = st.sidebar.slider("Server Learning Rate", 0.001, 0.1, 0.01, step=0.001,
+                                   help="Learning rate for server-side optimizer")
+elif strategy_name == "FedAvgM":
+    server_momentum = st.sidebar.slider("Server Momentum", 0.0, 0.99, 0.9, step=0.01,
+                                         help="Momentum for server aggregation")
 
 
 # Main content
@@ -550,6 +649,7 @@ def create_medmnist_client_fn(client_data, n_channels, n_classes, model_type,
 def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
                             n_clients, n_rounds, batch_size, local_epochs,
                             learning_rate, strategy_name, proximal_mu,
+                            server_lr=0.01, server_momentum=0.9,
                             domain_correlations=None, X_test=None, y_test=None):
     """Run FL simulation with MedMNIST data.
     
@@ -557,6 +657,8 @@ def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
         domain_correlations: Optional list of correlation values per client (for ColorMNIST)
         X_test: Optional global test set features (for ColorMNIST: 0% correlation)
         y_test: Optional global test set labels
+        server_lr: Server-side learning rate for FedOpt strategies
+        server_momentum: Server-side momentum for FedAvgM
     """
     
     # Clear any previous progress
@@ -576,29 +678,30 @@ def run_medmnist_simulation(client_data, n_channels, n_classes, model_type,
     # Create strategy with progress tracking
     use_fedprox = strategy_name == "FedProx"
     
-    if use_fedprox:
-        strategy = ProgressFedProx(
-            total_rounds=n_rounds,
-            fraction_fit=1.0,
-            fraction_evaluate=1.0,
-            min_fit_clients=n_clients,
-            min_evaluate_clients=n_clients,
-            min_available_clients=n_clients,
-            initial_parameters=initial_params,
-            evaluate_metrics_aggregation_fn=weighted_average,
-            proximal_mu=proximal_mu,
-        )
-    else:
-        strategy = ProgressFedAvg(
-            total_rounds=n_rounds,
-            fraction_fit=1.0,
-            fraction_evaluate=1.0,
-            min_fit_clients=n_clients,
-            min_evaluate_clients=n_clients,
-            min_available_clients=n_clients,
-            initial_parameters=initial_params,
-            evaluate_metrics_aggregation_fn=weighted_average,
-        )
+    # Common strategy parameters
+    strategy_params = dict(
+        total_rounds=n_rounds,
+        fraction_fit=1.0,
+        fraction_evaluate=1.0,
+        min_fit_clients=n_clients,
+        min_evaluate_clients=n_clients,
+        min_available_clients=n_clients,
+        initial_parameters=initial_params,
+        evaluate_metrics_aggregation_fn=weighted_average,
+    )
+    
+    if strategy_name == "FedProx":
+        strategy = ProgressFedProx(proximal_mu=proximal_mu, **strategy_params)
+    elif strategy_name == "FedAdam":
+        strategy = ProgressFedAdam(eta=server_lr, **strategy_params)
+    elif strategy_name == "FedYogi":
+        strategy = ProgressFedYogi(eta=server_lr, **strategy_params)
+    elif strategy_name == "FedAdagrad":
+        strategy = ProgressFedAdagrad(eta=server_lr, **strategy_params)
+    elif strategy_name == "FedAvgM":
+        strategy = ProgressFedAvgM(server_momentum=server_momentum, **strategy_params)
+    else:  # FedAvg
+        strategy = ProgressFedAvg(**strategy_params)
     
     # Create client function
     client_fn = create_medmnist_client_fn(
@@ -813,7 +916,7 @@ def compute_detailed_results(final_params, client_data, n_channels, n_classes,
 
 def run_synthetic_simulation(n_clients, n_rounds, n_samples, n_features, n_classes,
                              iid, strategy_name, proximal_mu, local_epochs, 
-                             batch_size, learning_rate):
+                             batch_size, learning_rate, server_lr=0.01, server_momentum=0.9):
     """Run FL simulation with synthetic data."""
     from client import create_client_fn
     from fedprox_client import create_fedprox_client_fn
@@ -841,33 +944,38 @@ def run_synthetic_simulation(n_clients, n_rounds, n_samples, n_features, n_class
         examples = [num_examples for num_examples, _ in metrics]
         return {"accuracy": sum(accuracies) / sum(examples)}
     
+    # Common strategy parameters
+    strategy_params = dict(
+        total_rounds=n_rounds,
+        fraction_fit=1.0,
+        fraction_evaluate=1.0,
+        min_fit_clients=n_clients,
+        min_evaluate_clients=n_clients,
+        min_available_clients=n_clients,
+        initial_parameters=initial_params,
+        evaluate_metrics_aggregation_fn=weighted_average,
+    )
+    
     # Create strategy with progress tracking
     if strategy_name == "FedProx":
-        strategy = ProgressFedProx(
-            total_rounds=n_rounds,
-            fraction_fit=1.0,
-            fraction_evaluate=1.0,
-            min_fit_clients=n_clients,
-            min_evaluate_clients=n_clients,
-            min_available_clients=n_clients,
-            initial_parameters=initial_params,
-            evaluate_metrics_aggregation_fn=weighted_average,
-            proximal_mu=proximal_mu,
-        )
+        strategy = ProgressFedProx(proximal_mu=proximal_mu, **strategy_params)
         client_fn = create_fedprox_client_fn(
             partitions, n_features=n_features, n_classes=n_classes, mu=proximal_mu
         )
-    else:
-        strategy = ProgressFedAvg(
-            total_rounds=n_rounds,
-            fraction_fit=1.0,
-            fraction_evaluate=1.0,
-            min_fit_clients=n_clients,
-            min_evaluate_clients=n_clients,
-            min_available_clients=n_clients,
-            initial_parameters=initial_params,
-            evaluate_metrics_aggregation_fn=weighted_average,
-        )
+    elif strategy_name == "FedAdam":
+        strategy = ProgressFedAdam(eta=server_lr, **strategy_params)
+        client_fn = create_client_fn(partitions, n_features=n_features, n_classes=n_classes)
+    elif strategy_name == "FedYogi":
+        strategy = ProgressFedYogi(eta=server_lr, **strategy_params)
+        client_fn = create_client_fn(partitions, n_features=n_features, n_classes=n_classes)
+    elif strategy_name == "FedAdagrad":
+        strategy = ProgressFedAdagrad(eta=server_lr, **strategy_params)
+        client_fn = create_client_fn(partitions, n_features=n_features, n_classes=n_classes)
+    elif strategy_name == "FedAvgM":
+        strategy = ProgressFedAvgM(server_momentum=server_momentum, **strategy_params)
+        client_fn = create_client_fn(partitions, n_features=n_features, n_classes=n_classes)
+    else:  # FedAvg
+        strategy = ProgressFedAvg(**strategy_params)
         client_fn = create_client_fn(partitions, n_features=n_features, n_classes=n_classes)
     
     # Run simulation
@@ -937,6 +1045,8 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
         "alpha": alpha,
         "strategy_name": strategy_name,
         "proximal_mu": proximal_mu,
+        "server_lr": server_lr,
+        "server_momentum": server_momentum,
         "local_epochs": local_epochs,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
@@ -959,7 +1069,9 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
                     proximal_mu=params["proximal_mu"],
                     local_epochs=params["local_epochs"],
                     batch_size=params["batch_size"],
-                    learning_rate=params["learning_rate"]
+                    learning_rate=params["learning_rate"],
+                    server_lr=params["server_lr"],
+                    server_momentum=params["server_momentum"]
                 )
             else:
                 loaded = medmnist_data.copy()
@@ -1000,6 +1112,8 @@ if st.button("▶️ Start Simulation", type="primary", disabled=st.session_stat
                     learning_rate=params["learning_rate"],
                     strategy_name=params["strategy_name"],
                     proximal_mu=params["proximal_mu"],
+                    server_lr=params["server_lr"],
+                    server_momentum=params["server_momentum"],
                     domain_correlations=loaded.get("domain_correlations"),
                     X_test=loaded.get("X_test"),
                     y_test=loaded.get("y_test")
