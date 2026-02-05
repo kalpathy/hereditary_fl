@@ -1,7 +1,23 @@
 """
-Streamlit Dashboard for Federated Learning Simulation with MedMNIST support.
+Streamlit Dashboard for Federated Learning Simulation.
+
+This is the main entry point for the FL demo dashboard. It provides:
+- Interactive controls for configuring FL simulations
+- Support for multiple datasets: ColorMNIST, MedMNIST, Synthetic
+- Multiple FL strategies: FedAvg, FedProx, FedAdam, FedYogi, FedAdagrad, FedAvgM
+- Real-time training progress visualization
+- Per-client and global accuracy metrics
 
 Run with: streamlit run app.py
+
+The dashboard will be available at http://localhost:8505
+
+Key Features:
+    - ColorMNIST: Demonstrates how FL helps with domain shift/spurious correlations
+    - MedMNIST: Real medical imaging federated scenarios  
+    - Synthetic: Quick experiments with configurable IID/non-IID splits
+
+Author: Kalpathy
 """
 
 import streamlit as st
@@ -24,11 +40,22 @@ from flwr.server.strategy import FedAvg, FedProx, FedAdagrad, FedAdam, FedYogi, 
 from flwr.common import Metrics, Parameters, Scalar, FitRes, EvaluateRes
 from flwr.server.client_proxy import ClientProxy
 
-# Progress tracking file
+# Progress tracking file - used to communicate between FL simulation thread and UI
 PROGRESS_FILE = Path(__file__).parent / ".fl_progress.json"
 
+
 def update_progress(current_round: int, total_rounds: int, stage: str = "training"):
-    """Update progress file for UI to read."""
+    """
+    Update progress file for UI to read.
+    
+    The FL simulation runs in a separate thread, so we use a JSON file
+    to communicate progress back to the Streamlit UI thread.
+    
+    Args:
+        current_round: Current FL training round (1-indexed)
+        total_rounds: Total number of FL rounds configured
+        stage: Human-readable description of current stage
+    """
     progress = {
         "current_round": current_round,
         "total_rounds": total_rounds,
@@ -56,12 +83,24 @@ def clear_progress():
 
 
 class ProgressFedAvg(FedAvg):
-    """FedAvg with progress tracking."""
+    """
+    FedAvg strategy with progress tracking for UI updates.
+    
+    FedAvg (Federated Averaging) is the baseline FL aggregation strategy.
+    Each round:
+      1. Server sends global model to selected clients
+      2. Clients train locally on their private data
+      3. Clients send model updates back to server
+      4. Server averages updates weighted by dataset size
+    
+    This wrapper adds progress tracking via the update_progress() function
+    so the Streamlit UI can show real-time training status.
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds
         self.current_round = 0
-        self.final_parameters = None  # Store final aggregated parameters
+        self.final_parameters = None  # Store final aggregated parameters for evaluation
     
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
@@ -78,12 +117,26 @@ class ProgressFedAvg(FedAvg):
 
 
 class ProgressFedProx(FedProx):
-    """FedProx with progress tracking."""
+    """
+    FedProx strategy with progress tracking for UI updates.
+    
+    FedProx extends FedAvg by adding a proximal term to the local objective,
+    which penalizes deviations from the global model. This helps with:
+      - Heterogeneous data distributions (non-IID)
+      - Systems heterogeneity (varying client capabilities)
+      - Preventing client drift during local training
+    
+    Key hyperparameter:
+      - proximal_mu: Strength of the proximal term (typical range: 0.01-1.0)
+        Higher values = stronger regularization toward global model
+    
+    Reference: https://arxiv.org/abs/1812.06127
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds
         self.current_round = 0
-        self.final_parameters = None  # Store final aggregated parameters
+        self.final_parameters = None  # Store final aggregated parameters for evaluation
     
     def aggregate_fit(self, server_round, results, failures):
         self.current_round = server_round
@@ -100,7 +153,19 @@ class ProgressFedProx(FedProx):
 
 
 class ProgressFedAdagrad(FedAdagrad):
-    """FedAdagrad with progress tracking."""
+    """
+    FedAdagrad strategy with progress tracking.
+    
+    Uses Adagrad optimizer on the server side for aggregating client updates.
+    Adagrad adapts the learning rate based on historical gradient information,
+    which can help with sparse gradients and varying feature frequencies.
+    
+    Key hyperparameters:
+      - server_lr (eta): Server-side learning rate
+      - tau: Controls initial scaling (typically 1e-9)
+    
+    Reference: https://arxiv.org/abs/2003.00295 (FedOpt paper)
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds
@@ -121,7 +186,20 @@ class ProgressFedAdagrad(FedAdagrad):
 
 
 class ProgressFedAdam(FedAdam):
-    """FedAdam with progress tracking."""
+    """
+    FedAdam strategy with progress tracking.
+    
+    Uses Adam optimizer on the server side for aggregating client updates.
+    Adam combines momentum and adaptive learning rates for faster convergence.
+    Often performs better than FedAvg on complex, non-convex objectives.
+    
+    Key hyperparameters:
+      - server_lr (eta): Server-side learning rate
+      - tau: Controls numerical stability (typically 1e-9)
+      - beta_1, beta_2: Momentum coefficients (default: 0.9, 0.99)
+    
+    Reference: https://arxiv.org/abs/2003.00295 (FedOpt paper)
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds
@@ -142,7 +220,20 @@ class ProgressFedAdam(FedAdam):
 
 
 class ProgressFedYogi(FedYogi):
-    """FedYogi with progress tracking."""
+    """
+    FedYogi strategy with progress tracking.
+    
+    Uses Yogi optimizer on the server side, which is a variant of Adam with
+    additive (rather than exponential) second moment updates. This provides
+    better control over effective learning rate growth and can be more stable.
+    
+    Key hyperparameters:
+      - server_lr (eta): Server-side learning rate
+      - tau: Controls numerical stability (typically 1e-9)
+      - beta_1, beta_2: Momentum coefficients (default: 0.9, 0.99)
+    
+    Reference: https://arxiv.org/abs/2003.00295 (FedOpt paper)
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds
@@ -163,7 +254,18 @@ class ProgressFedYogi(FedYogi):
 
 
 class ProgressFedAvgM(FedAvgM):
-    """FedAvgM (with momentum) with progress tracking."""
+    """
+    FedAvgM strategy with progress tracking.
+    
+    FedAvg with Momentum: Applies server-side momentum to the aggregated updates.
+    This can accelerate convergence and provide smoother training dynamics.
+    
+    Key hyperparameters:
+      - server_lr: Server-side learning rate
+      - server_momentum: Momentum coefficient (typical range: 0.9-0.99)
+    
+    Simpler than FedAdam/FedYogi but can still improve over vanilla FedAvg.
+    """
     def __init__(self, total_rounds: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.total_rounds = total_rounds

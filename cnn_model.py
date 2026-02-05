@@ -1,4 +1,24 @@
-"""CNN model for MedMNIST image classification in federated learning."""
+"""
+CNN models for MedMNIST and ColorMNIST image classification in federated learning.
+
+This module provides:
+- MedMNISTCNN: A 3-layer CNN for 28x28 medical/colored images
+- SimpleCNN: A smaller 2-layer CNN for faster training
+- Utility functions for FL: get_parameters, set_parameters, train_one_epoch, evaluate
+
+The models are designed to work with Flower FL framework:
+    - get_parameters(): Extract model weights as NumPy arrays for sending to server
+    - set_parameters(): Load NumPy arrays into model (from server aggregation)
+    - train_one_epoch(): Client-side local training
+    - evaluate(): Model evaluation on test data
+
+Usage:
+    model = get_cnn_model("simple", n_channels=3, n_classes=10)
+    params = get_parameters(model)  # For sending to FL server
+    set_parameters(model, new_params)  # After receiving from server
+
+Author: Kalpathy
+"""
 
 import torch
 import torch.nn as nn
@@ -11,9 +31,12 @@ class MedMNISTCNN(nn.Module):
     A CNN for 28x28 medical images (MedMNIST).
     
     Architecture:
-    - 2 convolutional layers with batch norm and max pooling
-    - 2 fully connected layers
-    - Dropout for regularization
+    - 3 convolutional layers with batch norm and max pooling
+    - 2 fully connected layers with dropout
+    - Suitable for MedMNIST datasets (PathMNIST, DermaMNIST, etc.)
+    
+    Input: (batch, n_channels, 28, 28)
+    Output: (batch, n_classes) - logits (use CrossEntropyLoss)
     """
     
     def __init__(self, n_channels: int = 3, n_classes: int = 9):

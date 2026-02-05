@@ -1,4 +1,26 @@
-"""MedMNIST dataset utilities for federated learning."""
+"""
+MedMNIST and ColorMNIST dataset utilities for federated learning.
+
+This module provides:
+- Loading and preprocessing of MedMNIST medical imaging datasets
+- ColorMNIST generation with controllable color-label correlations
+- Domain-based partitioning for simulating federated scenarios
+- IID and non-IID data splitting utilities
+
+ColorMNIST is particularly useful for demonstrating:
+- How spurious correlations affect model generalization
+- Why federated learning helps with domain shift
+- The value of diverse data in training robust models
+
+Usage:
+    # Load ColorMNIST with 4 domains
+    data = load_colormnist(n_samples=10000, n_domains=4)
+    
+    # Partition by domain for FL
+    partitions = partition_colormnist_by_domain(data, n_clients=4)
+
+Author: Kalpathy
+"""
 
 import numpy as np
 import torch
@@ -9,6 +31,10 @@ from medmnist import INFO
 
 
 # Available MedMNIST datasets with their properties
+# Each dataset has different characteristics useful for FL experiments:
+#   - n_channels: 1 for grayscale, 3 for RGB
+#   - n_classes: Number of classification targets
+#   - task: Type of classification problem
 MEDMNIST_DATASETS = {
     "pathmnist": {
         "name": "PathMNIST",
